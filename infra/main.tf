@@ -1,112 +1,101 @@
-terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-  }
-}
+name: CI/CD Pipeline to ECS Fargate
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
 
-provider "aws" {
-  region = "us-east-1"
-}
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: portfolio-api              # Matches aws_ecr_repository.api.name
+  ECS_SERVICE: portfolio-service            # Matches aws_ecs_service.api.name output
+  ECS_CLUSTER: portfolio-cluster            # Matches aws_ecs_cluster.portfolio.name output
+  CONTAINER_NAME: api                       # Matches your container_definitions.name
+  TASK_FAMILY: portfolio-api                # Matches aws_ecs_task_definition.api.family output
 
+jobs:
+  deploy:
+    name: Build, Test, Scan, Deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
 
-resource "aws_ecr_repository" "api" {
-  name                 = "portfolio-api" # The name that will appear in AWS Console
-  image_tag_mutability = "MUTABLE"
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
 
-  image_scanning_configuration {
-    scan_on_push = true
-  }
-}
+    - name: Configure AWS credentials (OIDC)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+        aws-region: ${{ env.AWS_REGION }}
+        role-session-name: GitHubActions-${{ github.run_id }}
 
-# VPC
-resource "aws_vpc" "main" {
-  cidr_block = "10.0.0.0/16"
-  tags = {
-    Name = "portfolio-vpc"
-  }
-}
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
 
-resource "aws_subnet" "public_a" {
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = "10.0.1.0/24"
-  availability_zone = "us-east-1a"
-  tags = {
-    Name = "public-a"
-  }
-}
+    - name: Build and push Docker image to ECR
+      id: build-image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+      run: |
+        IMAGE_TAG=${{ github.sha }}
+        docker build ./api --file ./api/Dockerfile \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+        echo "registry=$ECR_REGISTRY" >> $GITHUB_OUTPUT
 
-resource "aws_subnet" "public_b" {
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = "10.0.2.0/24"
-  availability_zone = "us-east-1b"
-  tags = {
-    Name = "public-b"
-  }
-}
+    - name: Run unit tests
+      run: |
+        docker run --rm ${{ steps.build-image.outputs.image }} pytest tests/ -v
 
-resource "aws_internet_gateway" "main" {
-  vpc_id = aws_vpc.main.id
-}
+    - name: Security scan with Trivy
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ steps.build-image.outputs.image }}
+        severity: 'CRITICAL,HIGH'
 
-resource "aws_route_table" "public" {
-  vpc_id = aws_vpc.main.id
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.main.id
-  }
-}
+    - name: Get current task definition
+      id: current-task-def
+      run: |
+        TASK_DEF_ARN=$(aws ecs describe-task-definition \
+          --task-definition ${{ env.TASK_FAMILY }} \
+          --query 'taskDefinition' \
+          --output json)
+        echo "task-definition=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
 
-resource "aws_route_table_association" "a" {
-  subnet_id      = aws_subnet.public_a.id
-  route_table_id = aws_route_table.public.id
-}
+    - name: Fill task definition with new image
+      id: task-def
+      uses: aws-actions/amazon-ecs-render-task-definition@v1
+      with:
+        task-definition: ${{ steps.current-task-def.outputs['task-definition'] }}
+        container-name: ${{ env.CONTAINER_NAME }}
+        image: ${{ steps.build-image.outputs.image }}
 
-resource "aws_route_table_association" "b" {
-  subnet_id      = aws_subnet.public_b.id
-  route_table_id = aws_route_table.public.id
-}
+    - name: Deploy to ECS (Blue/Green rolling update)
+      if: github.ref == 'refs/heads/main'
+      run: |
+        # Register new task definition
+        aws ecs register-task-definition \
+          --cli-input-json file://${{ steps.task-def.outputs.task-definition }} \
+          --family ${{ env.TASK_FAMILY }}
 
-# Security Group
-resource "aws_security_group" "alb" {
-  vpc_id = aws_vpc.main.id
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+        # Update service (triggers rolling deployment)
+        aws ecs update-service \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --service ${{ env.ECS_SERVICE }} \
+          --task-definition ${{ steps.task-def.outputs.task-definition }} \
+          --force-new-deployment
 
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-  tags = {
-    Name = "alb-sg"
-  }
-}
-
-resource "aws_security_group" "ecs" {
-  vpc_id = aws_vpc.main.id
-  ingress {
-    from_port       = 8080
-    to_port         = 8080
-    protocol        = "tcp"
-    security_groups = [aws_security_group.alb.id]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name = "ecs-sg"
-  }
-}
+    - name: Verify deployment
+      if: github.ref == 'refs/heads/main'
+      run: |
+        aws ecs wait services-stable \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --services ${{ env.ECS_SERVICE }}
+        echo "✅ Deployment successful! Check your ALB: ${{ needs.terraform.outputs.alb_dns }}"
