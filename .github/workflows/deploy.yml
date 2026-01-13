@@ -20,7 +20,159 @@ jobs:
             echo "Secret key is present (not empty)."
           fi
 
+      - name: Configure AWS credentialsname: Deploy to ECS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: portfolio-api
+  ECS_SERVICE: portfolio-service
+  ECS_CLUSTER: portfolio-cluster
+  CONTAINER_NAME: api
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        
+      - name: Run tests
+        run: |
+          cd api
+          npm test  # or your test command
+          
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Check if Dockerfile exists
+          if [ ! -f "api/Dockerfile" ]; then
+            echo "ERROR: api/Dockerfile not found"
+            exit 1
+          fi
+          
+          # Build with cache
+          docker build -f api/Dockerfile \
+            --cache-from $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest \
+            -t $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG \
+            -t $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest \
+            ./api/
+          
+          # Push images
+          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG
+          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest
+          
+          echo "image=$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Scan image for vulnerabilities
+        run: |
+          aws ecr start-image-scan \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-id imageTag=${{ github.sha }}
+          
+          # Wait for scan to complete
+          aws ecr wait image-scan-complete \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-id imageTag=${{ github.sha }}
+          
+          # Check findings
+          FINDINGS=$(aws ecr describe-image-scan-findings \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-id imageTag=${{ github.sha }} \
+            --query 'imageScanFindings.findingSeverityCounts.CRITICAL' \
+            --output text)
+          
+          if [ "$FINDINGS" != "None" ] && [ "$FINDINGS" -gt 0 ]; then
+            echo "ERROR: Found $FINDINGS critical vulnerabilities"
+            exit 1
+          fi
+
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECR_REPOSITORY }} \
+            --query 'taskDefinition' > task-definition.json
+
+      - name: Fill in the new image ID in the Amazon ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Verify deployment
+        timeout-minutes: 5
+        run: |
+          # Add health check verification
+          TASK_ARN=$(aws ecs list-tasks \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service-name ${{ env.ECS_SERVICE }} \
+            --query 'taskArns[0]' --output text)
+          
+          aws ecs wait tasks-running \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --tasks $TASK_ARN
+
+      - name: Cleanup old images
+        if: success()
+        run: |
+          # Keep last 5 images
+          aws ecr list-images \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --query 'imageIds[?type(imageTag)!=`string`].[imageDigest]' \
+            --output text | head -n -5 | while read digest; do
+            aws ecr batch-delete-image \
+              --repository-name ${{ env.ECR_REPOSITORY }} \
+              --image-ids imageDigest=$digest || true
+          done
+
+      - name: Notify on failure
+        if: failure()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: 'Deployment failed for ${{ github.sha }}'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
