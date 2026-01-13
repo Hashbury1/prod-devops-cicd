@@ -8,13 +8,6 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    env:
-      AWS_REGION: us-east-1
-      AWS_DEFAULT_REGION: us-east-1
-      ECR_REPOSITORY: portfolio-api
-      ECS_CLUSTER: portfolio-cluster
-      ECS_SERVICE: portfolio-service
-      
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -29,34 +22,34 @@ jobs:
     - name: Login to Amazon ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
-      env:
-        AWS_REGION: us-east-1
-        AWS_DEFAULT_REGION: us-east-1
 
-    - name: Build, tag, and push image to ECR
+    - name: Build, tag, and push image to ECR 
+      id: build-image
       env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: portfolio-api
         IMAGE_TAG: ${{ github.sha }}
-        REGISTRY: ${{ steps.login-ecr.outputs.registry }}
       run: |
         docker build -f api/Dockerfile \
-          -t $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
-          -t $REGISTRY/$ECR_REPOSITORY:latest \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
           ./api/
-        docker push $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-        docker push $REGISTRY/$ECR_REPOSITORY:latest
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
     - name: Download task definition
       run: |
         aws ecs describe-task-definition --task-definition portfolio-api \
           --query taskDefinition > task-definition.json
 
-    - name: Fill in the new image ID
+    - name: Fill in the new image ID in the Amazon ECS task definition
       id: task-def
       uses: aws-actions/amazon-ecs-render-task-definition@v1
       with:
         task-definition: task-definition.json
         container-name: api
-        image: ${{ steps.login-ecr.outputs.registry }}/portfolio-api:${{ github.sha }}
+        image: ${{ steps.build-image.outputs.image }}
 
     - name: Deploy Amazon ECS task definition
       uses: aws-actions/amazon-ecs-deploy-task-definition@v1
