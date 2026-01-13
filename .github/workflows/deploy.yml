@@ -20,7 +20,7 @@ jobs:
             echo "Secret key is present (not empty)."
           fi
 
-      - name: Configure AWS credentialsname: Deploy to ECS
+    
 
 on:
   push:
