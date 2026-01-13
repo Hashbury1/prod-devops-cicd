@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
       ECR_REPOSITORY: portfolio-api
       ECS_CLUSTER: portfolio-cluster
       ECS_SERVICE: portfolio-service
@@ -28,6 +29,9 @@ jobs:
     - name: Login to Amazon ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
+      env:
+        AWS_REGION: us-east-1
+        AWS_DEFAULT_REGION: us-east-1
 
     - name: Build, tag, and push image to ECR
       env:
@@ -46,7 +50,7 @@ jobs:
         aws ecs describe-task-definition --task-definition portfolio-api \
           --query taskDefinition > task-definition.json
 
-    - name: Fill in the new image ID in the Amazon ECS task definition
+    - name: Fill in the new image ID
       id: task-def
       uses: aws-actions/amazon-ecs-render-task-definition@v1
       with:
