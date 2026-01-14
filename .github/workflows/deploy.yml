@@ -1,4 +1,4 @@
-name: CI/CD Pipeline to ECS Fargate-v2 
+name: CI/CD Pipeline to ECS Fargate-v2  # ← Change name to break cache
 
 on:
   push:
@@ -23,8 +23,8 @@ jobs:
 
       - name: 🔍 Debug AWS secrets presence
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ACCESS_KEY_ID: AKIA2QFKTYQZ7PED7NIO
+          AWS_SECRET_ACCESS_KEY: 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
         run: |
           echo "=== AWS Secret Debug ==="
           echo "AWS_ACCESS_KEY_ID length: ${#AWS_ACCESS_KEY_ID}"
