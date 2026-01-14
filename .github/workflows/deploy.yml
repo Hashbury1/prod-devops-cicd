@@ -4,13 +4,17 @@ on:
     branches: [ main ]
   workflow_dispatch: 
 
-
-
 jobs:
   deploy:
     name: Build and Deploy
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      AWS_REGION: us-east-1
+      ECR_REPOSITORY: portfolio-api
+      ECS_SERVICE: portfolio-service
+      ECS_CLUSTER: portfolio-cluster
+      CONTAINER_NAME: api
 
     steps:
       - name: Checkout code
@@ -34,7 +38,7 @@ jobs:
           
           if [ -z "${AWS_SECRET_ACCESS_KEY}" ]; then
             echo "❌ AWS_SECRET_ACCESS_KEY is EMPTY or not accessible"
-            exit 
+            exit 1
           else
             echo "✅ AWS_SECRET_ACCESS_KEY is present (${#AWS_SECRET_ACCESS_KEY} chars)"
           fi
@@ -64,7 +68,7 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
           
-          # Output the starting image_URL for the 'render-task-definition' step
+          # Output the image URL for the 'render-task-definition' step
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
       - name: Download current task definition
