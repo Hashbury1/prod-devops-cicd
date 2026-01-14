@@ -4,12 +4,7 @@ on:
     branches: [ main ]
   workflow_dispatch: 
 
-env:
-  AWS_REGION: us-east-1
-  ECR_REPOSITORY: portfolio-api
-  ECS_SERVICE: portfolio-service
-  ECS_CLUSTER: portfolio-cluster
-  CONTAINER_NAME: api
+
 
 jobs:
   deploy:
