@@ -1,101 +1,155 @@
-name: CI/CD Pipeline to ECS Fargate
-on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
 
-env:
-  AWS_REGION: us-east-1
-  ECR_REPOSITORY: portfolio-api              # Matches aws_ecr_repository.api.name
-  ECS_SERVICE: portfolio-service            # Matches aws_ecs_service.api.name output
-  ECS_CLUSTER: portfolio-cluster            # Matches aws_ecs_cluster.portfolio.name output
-  CONTAINER_NAME: api                       # Matches your container_definitions.name
-  TASK_FAMILY: portfolio-api                # Matches aws_ecs_task_definition.api.family output
+provider "aws" {
+  region = "us-east-1"
+}
 
-jobs:
-  deploy:
-    name: Build, Test, Scan, Deploy
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
+# Data sources - ADDED (missing)
+data "aws_vpcs" "available" {
+  filter {
+    name   = "state"
+    values = ["available"]
+  }
+}
 
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+data "aws_vpc" "selected" {
+  id = data.aws_vpcs.available.ids[0]
+}
 
-    - name: Configure AWS credentials (OIDC)
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-        aws-region: ${{ env.AWS_REGION }}
-        role-session-name: GitHubActions-${{ github.run_id }}
+data "aws_subnets" "public" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.selected.id]
+  }
+  filter {
+    name   = "map-public-ip-on-launch"
+    values = ["true"]
+  }
+}
 
-    - name: Login to Amazon ECR
-      id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v2
+# ECR Repository
+resource "aws_ecr_repository" "portfolio_api" {
+  name                 = "portfolio-api"
+  image_tag_mutability = "MUTABLE"
 
-    - name: Build and push Docker image to ECR
-      id: build-image
-      env:
-        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-      run: |
-        IMAGE_TAG=${{ github.sha }}
-        docker build ./api --file ./api/Dockerfile \
-          -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
-          -t $ECR_REGISTRY/$ECR_REPOSITORY:latest
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
-        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
-        echo "registry=$ECR_REGISTRY" >> $GITHUB_OUTPUT
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+}
 
-    - name: Run unit tests
-      run: |
-        docker run --rm ${{ steps.build-image.outputs.image }} pytest tests/ -v
+# ECS Cluster
+resource "aws_ecs_cluster" "portfolio" {
+  name = "portfolio-cluster"
 
-    - name: Security scan with Trivy
-      uses: aquasecurity/trivy-action@master
-      with:
-        image-ref: ${{ steps.build-image.outputs.image }}
-        severity: 'CRITICAL,HIGH'
+  setting {
+    name  = "containerInsights"
+    value = "enabled"
+  }
+}
 
-    - name: Get current task definition
-      id: current-task-def
-      run: |
-        TASK_DEF_ARN=$(aws ecs describe-task-definition \
-          --task-definition ${{ env.TASK_FAMILY }} \
-          --query 'taskDefinition' \
-          --output json)
-        echo "task-definition=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+# ECS Task Execution Role
+resource "aws_iam_role" "ecs_task_execution" {
+  name = "portfolio-cluster-task-execution"
 
-    - name: Fill task definition with new image
-      id: task-def
-      uses: aws-actions/amazon-ecs-render-task-definition@v1
-      with:
-        task-definition: ${{ steps.current-task-def.outputs['task-definition'] }}
-        container-name: ${{ env.CONTAINER_NAME }}
-        image: ${{ steps.build-image.outputs.image }}
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
 
-    - name: Deploy to ECS (Blue/Green rolling update)
-      if: github.ref == 'refs/heads/main'
-      run: |
-        # Register new task definition
-        aws ecs register-task-definition \
-          --cli-input-json file://${{ steps.task-def.outputs.task-definition }} \
-          --family ${{ env.TASK_FAMILY }}
+resource "aws_iam_role_policy_attachment" "ecs_task_execution" {
+  role       = aws_iam_role.ecs_task_execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
 
-        # Update service (triggers rolling deployment)
-        aws ecs update-service \
-          --cluster ${{ env.ECS_CLUSTER }} \
-          --service ${{ env.ECS_SERVICE }} \
-          --task-definition ${{ steps.task-def.outputs.task-definition }} \
-          --force-new-deployment
+# ECS Security Group
+resource "aws_security_group" "ecs" {
+  vpc_id = data.aws_vpc.selected.id  # ← FIXED: was data.aws_vpc.default.id
+  name   = "portfolio-ecs-sg"
 
-    - name: Verify deployment
-      if: github.ref == 'refs/heads/main'
-      run: |
-        aws ecs wait services-stable \
-          --cluster ${{ env.ECS_CLUSTER }} \
-          --services ${{ env.ECS_SERVICE }}
-        echo "✅ Deployment successful! Check your ALB: ${{ needs.terraform.outputs.alb_dns }}"
+  ingress {
+    from_port   = 8080
+    to_port     = 8080
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# CloudWatch Log Group
+resource "aws_cloudwatch_log_group" "ecs" {
+  name              = "/ecs/portfolio-cluster"
+  retention_in_days = 7
+}
+
+# ECS Task Definition
+resource "aws_ecs_task_definition" "portfolio_api" {
+  family                   = "portfolio-api"
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu                      = "256"
+  memory                   = "512"
+  execution_role_arn       = aws_iam_role.ecs_task_execution.arn
+
+  container_definitions = jsonencode([
+    {
+      name  = "api"
+      image = "${aws_ecr_repository.portfolio_api.repository_url}:latest"
+      essential = true
+      portMappings = [
+        {
+          containerPort = 8080
+          hostPort      = 8080
+          protocol      = "tcp"
+        }
+      ]
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          awslogs-group         = aws_cloudwatch_log_group.ecs.name
+          awslogs-region        = "us-east-1"
+          awslogs-stream-prefix = "ecs"
+        }
+      }
+    }
+  ])
+}
+
+# ECS Service  
+resource "aws_ecs_service" "portfolio_api" {
+  name            = "portfolio-service"
+  cluster         = aws_ecs_cluster.portfolio.id
+  task_definition = aws_ecs_task_definition.portfolio_api.arn
+  desired_count   = 1
+
+  network_configuration {
+    subnets          = data.aws_subnets.public.ids  # ← FIXED: was data.aws_subnets.default.ids
+    security_groups  = [aws_security_group.ecs.id]
+    assign_public_ip = true
+  }
+
+  force_new_deployment = true
+
+  depends_on = [aws_iam_role_policy_attachment.ecs_task_execution]
+}
