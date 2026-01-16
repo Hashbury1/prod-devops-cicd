@@ -7,11 +7,13 @@ terraform {
   }
 }
 
+
+
 provider "aws" {
   region = "us-east-1"
 }
 
-# Data sources - ADDED (missing)
+# Data sources
 data "aws_vpcs" "available" {
   filter {
     name   = "state"
@@ -72,21 +74,47 @@ resource "aws_iam_role" "ecs_task_execution" {
   })
 }
 
-resource "aws_iam_role_policy_attachment" "ecs_task_execution" {
-  role       = aws_iam_role.ecs_task_execution.name
+# - ECS Task Execution Role
+resource "aws_iam_role" "ecs_task_execution_role" {
+  name = "ecsTaskExecutionRole"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+# Attached AWS managed policy
+resource "aws_iam_role_policy_attachment" "ecs_task_execution" { 
+  role       = aws_iam_role.ecs_task_execution_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-# ECS Security Group
-resource "aws_security_group" "ecs" {
-  vpc_id = data.aws_vpc.selected.id  # ← FIXED: was data.aws_vpc.default.id
-  name   = "portfolio-ecs-sg"
 
+
+# ECS Security Group
+data "aws_security_group" "alb" {
+  id = "sg-0e140bec6de28cd10"  # 
+}
+
+resource "aws_security_group" "ecs_tasks" {
+  name_prefix = "portfolio-ecs-tasks-"
+  vpc_id      = "vpc-055f4b07b3ebbb1bb" 
+
+  # Reference the data source correctly
   ingress {
-    from_port   = 8080
-    to_port     = 8080
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    from_port       = 8080
+    to_port         = 8080
+    protocol        = "tcp"
+    security_groups = [data.aws_security_group.alb.id] 
   }
 
   egress {
@@ -95,7 +123,12 @@ resource "aws_security_group" "ecs" {
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
+  tags = {
+    Name = "portfolio-ecs-tasks"
+  }
 }
+
 
 # CloudWatch Log Group
 resource "aws_cloudwatch_log_group" "ecs" {
@@ -103,31 +136,34 @@ resource "aws_cloudwatch_log_group" "ecs" {
   retention_in_days = 7
 }
 
-# ECS Task Definition
+#Data source
+data "aws_caller_identity" "current" {}
+
 resource "aws_ecs_task_definition" "portfolio_api" {
-  family                   = "portfolio-api"
+  family                   = "portfolio-api-task"
   network_mode             = "awsvpc"
   requires_compatibilities = ["FARGATE"]
-  cpu                      = "256"
-  memory                   = "512"
-  execution_role_arn       = aws_iam_role.ecs_task_execution.arn
+  cpu                      = 256
+  memory                   = 512
+  execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
 
   container_definitions = jsonencode([
     {
-      name  = "api"
-      image = "${aws_ecr_repository.portfolio_api.repository_url}:latest"
-      essential = true
+      name  = "portfolio-api"
+      image = "${data.aws_caller_identity.current.account_id}.dkr.ecr.us-east-1.amazonaws.com/portfolio-api:latest"
+      
       portMappings = [
         {
           containerPort = 8080
-          hostPort      = 8080
           protocol      = "tcp"
         }
       ]
+      
+      # Add logging configuration
       logConfiguration = {
         logDriver = "awslogs"
         options = {
-          awslogs-group         = aws_cloudwatch_log_group.ecs.name
+          awslogs-group         = "/ecs/portfolio-api"
           awslogs-region        = "us-east-1"
           awslogs-stream-prefix = "ecs"
         }
@@ -136,20 +172,45 @@ resource "aws_ecs_task_definition" "portfolio_api" {
   ])
 }
 
+
+
 # ECS Service  
 resource "aws_ecs_service" "portfolio_api" {
-  name            = "portfolio-service"
-  cluster         = aws_ecs_cluster.portfolio.id
+  name            = "portfolio-service-v2"
+  cluster         = "arn:aws:ecs:us-east-1:721912316979:cluster/portfolio-cluster"
   task_definition = aws_ecs_task_definition.portfolio_api.arn
   desired_count   = 1
+  launch_type     = "FARGATE"
 
+  # Network config goes HERE (inside service block)
   network_configuration {
-    subnets          = data.aws_subnets.public.ids  # ← FIXED: was data.aws_subnets.default.ids
-    security_groups  = [aws_security_group.ecs.id]
-    assign_public_ip = true
+    subnets          = ["subnet-05dc7473a3e87bb28", "subnet-05ac53e23e072eadb"]
+    security_groups  = [aws_security_group.ecs_tasks.id]
+    assign_public_ip = false
   }
 
-  force_new_deployment = true
+  load_balancer {
+    target_group_arn = "arn:aws:elasticloadbalancing:us-east-1:721912316979:targetgroup/portfolio-api/6bc797771e5549c7"
+    container_name   = "portfolio-api"
+    container_port   = 8080
+  }
+}
 
-  depends_on = [aws_iam_role_policy_attachment.ecs_task_execution]
+
+
+resource "aws_iam_role_policy_attachment" "ecs_execution_role_policy" {
+  role       = aws_iam_role.ecs_task_execution_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+
+data "aws_subnets" "private" {
+  filter {
+    name   = "vpc-id"
+    values = [var.vpc_id]
+  }
+  filter {
+    name   = "tag:Name"
+    values = ["private-*"]
+  }
 }
