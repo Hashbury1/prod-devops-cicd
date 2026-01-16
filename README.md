@@ -1,1 +1,1 @@
-A portfolio project to show Pipeline that builds, tests, scans, and deploys a containerized app to ECS 
+A Real time project for my portfolio to show a CICD Pipeline that builds, tests, scans, and deploys a containerized python app to ECS and AWS Fargate using Terraform for IaC, AWS IAM for security, Github Actions for Deployment. 

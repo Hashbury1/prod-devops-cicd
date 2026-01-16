@@ -8,7 +8,7 @@ terraform {
 }
 
 
-
+# Cloud Provider
 provider "aws" {
   region = "us-east-1"
 }
@@ -56,7 +56,7 @@ resource "aws_ecs_cluster" "portfolio" {
   }
 }
 
-# ECS Task Execution Role
+# ECS Task IAM Role
 resource "aws_iam_role" "ecs_task_execution" {
   name = "portfolio-cluster-task-execution"
 
@@ -197,12 +197,14 @@ resource "aws_ecs_service" "portfolio_api" {
 }
 
 
-
+# IAM policy Attached
 resource "aws_iam_role_policy_attachment" "ecs_execution_role_policy" {
   role       = aws_iam_role.ecs_task_execution_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
+
+# Data source for AWS subnet
 
 data "aws_subnets" "private" {
   filter {

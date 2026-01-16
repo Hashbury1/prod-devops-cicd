@@ -1,16 +1,16 @@
 FROM python:3.11-slim
 
-# List files first (debug)
+# Set working directory to /tmp to inspect context
 RUN echo "Files in context:" && ls -la /tmp/ && ls -la .
 
 WORKDIR /app
 
-# Copy only requirements first
+# Copy only requirements first here for better caching
 COPY requirements.txt .
 RUN ls -la requirements.txt  # Debug
 RUN pip install -r requirements.txt
 
-# Copy rest
+# Copy all
 COPY . .
 RUN ls -la /app/api/  # Debug
 
